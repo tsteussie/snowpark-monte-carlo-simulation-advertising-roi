@@ -1,0 +1,515 @@
+import os
+os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"  # Ensure matplotlib can write its cache
+import snowflake.snowpark as snowpark
+from snowflake.snowpark import Session
+from snowflake.snowpark.functions import col, lit, avg as sf_avg, stddev as sf_stddev, floor as sf_floor, random as sf_random, normal as sf_normal
+from functools import reduce
+import math
+import matplotlib.pyplot as plt
+
+# -----------------------------------------------------------------------------
+# 1) SIMULATION PARAMETERS
+# -----------------------------------------------------------------------------
+
+num_batches = 3
+batch_size = 100  # total simulations per batch
+block_count = 10  # for convergence analysis
+
+marketing_spend = {
+    "channel_A": 10000.0,
+    "channel_B":  8200.0,
+    "channel_C":  7400.0,
+    "channel_D":  6300.0,
+    "channel_E":  5100.0,
+}
+
+channels = list(marketing_spend.keys())
+
+# -----------------------------------------------------------------------------
+# 2) SPECIFY DISTRIBUTIONS
+# -----------------------------------------------------------------------------
+
+# CUSTOMER SEGMENT DISTRIBTION PER MARKETING CHANNEL
+segment_ratio_specs = {
+    "channel_A": {
+        "segment_V": {"mean": 0.20, "std": 0.02},
+        "segment_W": {"mean": 0.22, "std": 0.02},
+        "segment_X": {"mean": 0.22, "std": 0.03},
+        "segment_Y": {"mean": 0.22, "std": 0.03},
+    },
+    "channel_B": {
+        "segment_V": {"mean": 0.18, "std": 0.04},
+        "segment_W": {"mean": 0.22, "std": 0.03},
+        "segment_X": {"mean": 0.22, "std": 0.03},
+        "segment_Y": {"mean": 0.22, "std": 0.03},
+    },
+    "channel_C": {
+        "segment_V": {"mean": 0.20, "std": 0.02},
+        "segment_W": {"mean": 0.22, "std": 0.02},
+        "segment_X": {"mean": 0.22, "std": 0.03},
+        "segment_Y": {"mean": 0.22, "std": 0.03},
+    },
+    "channel_D": {
+        "segment_V": {"mean": 0.20, "std": 0.02},
+        "segment_W": {"mean": 0.22, "std": 0.02},
+        "segment_X": {"mean": 0.22, "std": 0.03},
+        "segment_Y": {"mean": 0.22, "std": 0.03},
+    },
+    "channel_E": {
+        "segment_V": {"mean": 0.20, "std": 0.02},
+        "segment_W": {"mean": 0.22, "std": 0.02},
+        "segment_X": {"mean": 0.22, "std": 0.03},
+        "segment_Y": {"mean": 0.22, "std": 0.03},
+    },
+}
+
+# COMPUTE RESIDUAL FOR SEGMENT Z TO ENSURE SUM = 1
+for ch, specs in segment_ratio_specs.items():
+    total_mean = sum(v["mean"] for v in specs.values())
+    specs["segment_Z"] = {"mean": 1.0 - total_mean, "std": 0.0}
+
+segments = ["segment_V", "segment_W", "segment_X", "segment_Y", "segment_Z"]
+
+# MARKETING-SPEND PER LEAD DISTRIBUTIONS
+marketing_spend_to_lead_ratio_specs = {
+    "channel_A": {"mean": 35.5, "std": 3.2},
+    "channel_B": {"mean": 31.2, "std": 3.8},
+    "channel_C": {"mean": 29.8, "std": 4.2},
+    "channel_D": {"mean": 44.2, "std": 6.6},
+    "channel_E": {"mean": 34.5, "std": 4.1}}
+
+# CONVERSION RATE DISTRIBUTIONS
+conversion_rate_specs = {
+    "channel_A": {"segment_V": {"mean":0.04, "std":0.010},
+                  "segment_W": {"mean":0.02, "std":0.020},
+                  "segment_X": {"mean":0.05, "std":0.020},
+                  "segment_Y": {"mean":0.04, "std":0.015},
+                  "segment_Z": {"mean":0.06, "std":0.010}},
+    "channel_B": {"segment_V": {"mean":0.05, "std":0.010},
+                  "segment_W": {"mean":0.06, "std":0.020},
+                  "segment_X": {"mean":0.07, "std":0.025},
+                  "segment_Y": {"mean":0.06, "std":0.020},
+                  "segment_Z": {"mean":0.05, "std":0.015}},
+    "channel_C": {"segment_V": {"mean":0.04, "std":0.010},
+                  "segment_W": {"mean":0.06, "std":0.020},
+                  "segment_X": {"mean":0.04, "std":0.016},
+                  "segment_Y": {"mean":0.05, "std":0.015},
+                  "segment_Z": {"mean":0.04, "std":0.014}},
+    "channel_D": {"segment_V": {"mean":0.04, "std":0.010},
+                  "segment_W": {"mean":0.05, "std":0.010},
+                  "segment_X": {"mean":0.06, "std":0.020},
+                  "segment_Y": {"mean":0.04, "std":0.020},
+                  "segment_Z": {"mean":0.03, "std":0.025}},
+    "channel_E": {"segment_V": {"mean":0.05, "std":0.022},
+                  "segment_W": {"mean":0.04, "std":0.010},
+                  "segment_X": {"mean":0.06, "std":0.020},
+                  "segment_Y": {"mean":0.05, "std":0.015},
+                  "segment_Z": {"mean":0.05, "std":0.020}},
+}
+
+# SALES REVENUE DISTRIBUTIONS
+sales_revenue_specs = {
+    "channel_A": {"segment_V": {"mean":  1100.0, "std":  100.0},
+                  "segment_W": {"mean":  1200.0, "std":  150.0},
+                  "segment_X": {"mean":  8000.0, "std": 2000.0},
+                  "segment_Y": {"mean": 12400.0, "std": 2500.0},
+                  "segment_Z": {"mean": 13100.0, "std": 2650.0}},
+    "channel_B": {"segment_V": {"mean":  1050.0, "std":  150.0},
+                  "segment_W": {"mean":  3800.0, "std":  550.0},
+                  "segment_X": {"mean":  7500.0, "std": 1750.0},
+                  "segment_Y": {"mean": 13400.0, "std": 3100.0},
+                  "segment_Z": {"mean": 11800.0, "std": 2250.0}},
+    "channel_C": {"segment_V": {"mean":   950.0, "std":   70.0},
+                  "segment_W": {"mean":  1200.0, "std":  150.0},
+                  "segment_X": {"mean":  8000.0, "std": 2000.0},
+                  "segment_Y": {"mean": 12400.0, "std": 2500.0},
+                  "segment_Z": {"mean": 13100.0, "std": 2650.0}},
+    "channel_D": {"segment_V": {"mean":  1050.0, "std":  170.0},
+                  "segment_W": {"mean":  1400.0, "std":  250.0},
+                  "segment_X": {"mean":  7700.0, "std": 1100.0},
+                  "segment_Y": {"mean": 12600.0, "std": 1900.0},
+                  "segment_Z": {"mean": 14300.0, "std": 3650.0}},
+    "channel_E": {"segment_V": {"mean":   900.0, "std":   90.0},
+                  "segment_W": {"mean":  1400.0, "std":  250.0},
+                  "segment_X": {"mean":  9200.0, "std": 2850.0},
+                  "segment_Y": {"mean": 11750.0, "std": 2150.0},
+                  "segment_Z": {"mean": 12600.0, "std": 2150.0}},
+}
+
+# PROFIT MARGIN DISTRIBUTIONS
+profit_margin_specs = {
+    "channel_A": { seg: {"mean": m, "std": s} for seg, (m,s) in {
+        "segment_V": (0.13, 0.04),
+        "segment_W": (0.12, 0.05),
+        "segment_X": (0.18, 0.05),
+        "segment_Y": (0.14, 0.04),
+        "segment_Z": (0.18, 0.03),
+    }.items()},
+    "channel_B": { seg: {"mean": m, "std": s} for seg, (m,s) in {
+        "segment_V": (0.14, 0.04),
+        "segment_W": (0.12, 0.03),
+        "segment_X": (0.17, 0.05),
+        "segment_Y": (0.16, 0.04),
+        "segment_Z": (0.14, 0.03),
+    }.items()},
+    "channel_C": { seg: {"mean": m, "std": s} for seg, (m,s) in {
+        "segment_V": (0.14, 0.04),
+        "segment_W": (0.12, 0.04),
+        "segment_X": (0.16, 0.05),
+        "segment_Y": (0.14, 0.04),
+        "segment_Z": (0.15, 0.03),
+    }.items()},
+    "channel_D": { seg: {"mean": m, "std": s} for seg, (m,s) in {
+        "segment_V": (0.14, 0.04),
+        "segment_W": (0.12, 0.05),
+        "segment_X": (0.19, 0.04),
+        "segment_Y": (0.15, 0.04),
+        "segment_Z": (0.17, 0.04),
+    }.items()},
+    "channel_E": { seg: {"mean": m, "std": s} for seg, (m,s) in {
+        "segment_V": (0.14, 0.04),
+        "segment_W": (0.12, 0.05),
+        "segment_X": (0.18, 0.04),
+        "segment_Y": (0.15, 0.04),
+        "segment_Z": (0.13, 0.03),
+    }.items()},
+}
+
+# -----------------------------------------------------------------------------
+# 3) GENERATE ONE BATCH OF SIMULATIONS
+# -----------------------------------------------------------------------------
+
+def generate_batch(session: Session, batch_id: int, num_simulations: int):
+    # start with simulation index column
+    df = session.range(0, num_simulations).with_column_renamed("ID", "sim_idx")
+
+    for ch in channels:
+        
+        # INJECT MARKETING SPEND
+        spend = marketing_spend[ch]
+        df = df.with_column(f"{ch}_spend", lit(spend))
+
+        # COMPUTE MARKETING-SPEND → LEAD RATIO & TOTAL LEADS
+        ratio_spec = marketing_spend_to_lead_ratio_specs[ch]
+        lead_ratio_expr = sf_normal(ratio_spec["mean"], ratio_spec["std"], sf_random())
+        df = df.with_column(f"{ch}_lead_ratio", lead_ratio_expr)
+        df = df.with_column(f"{ch}_leads", col(f"{ch}_spend") / col(f"{ch}_lead_ratio"))
+
+        # DEFINE BASE/NON-RESIDUAL SEGMENTS
+        residual_seg = segments[-1]
+        base_segments = [s for s in segments if s != residual_seg]
+
+        # SAMPLE RATIO FOR EACH BASE SEGMENT
+        ratio_cols = {}
+        for seg in base_segments:
+            spec = segment_ratio_specs[ch][seg]
+            r_expr = sf_normal(spec["mean"], spec["std"], sf_random())
+            col_name = f"{ch}_{seg}_ratio"
+            df = df.with_column(col_name, r_expr)
+            ratio_cols[seg] = col(col_name)
+
+        # COMPUTE RESIDUAL SEGMENT TO SUM TO ONE
+        total_base = sum(ratio_cols.values())
+        df = df.with_column(f"{ch}_{residual_seg}_ratio", lit(1.0) - total_base)
+
+        # EXECUTE ACTIONS ACROSS SEGMENTS
+        for seg in segments:
+            
+            # ALLOCATE LEADS
+            ratio_col = f"{ch}_{seg}_ratio"
+            df = df.with_column(f"{ch}_{seg}_lead_alloc", col(f"{ch}_leads") * col(ratio_col))
+            
+            # CALCULATE ORDERS USING CONVERSION RATE
+            cr = conversion_rate_specs[ch][seg]
+            rate_expr = sf_normal(cr["mean"], cr["std"], sf_random())
+            df = df.with_column(f"{ch}_{seg}_rate", rate_expr)
+            df = df.with_column(f"{ch}_{seg}_total_orders", col(f"{ch}_{seg}_lead_alloc") * col(f"{ch}_{seg}_rate"))
+            
+            # CALCULATE REVENUE
+            rev = sales_revenue_specs[ch][seg]
+            rev_expr = sf_normal(rev["mean"], rev["std"], sf_random())
+            df = df.with_column(f"{ch}_{seg}_rev_per_unit", rev_expr)
+            df = df.with_column(f"{ch}_{seg}_total_revenue", col(f"{ch}_{seg}_total_orders") * col(f"{ch}_{seg}_rev_per_unit"))
+            
+            # CALCULATE PROFIT
+            pm = profit_margin_specs[ch][seg]
+            pm_expr = sf_normal(pm["mean"], pm["std"], sf_random())
+            df = df.with_column(f"{ch}_{seg}_margin_pct", pm_expr)
+            df = df.with_column(f"{ch}_{seg}_total_profit", col(f"{ch}_{seg}_total_revenue") * col(f"{ch}_{seg}_margin_pct"))
+
+    # TAG BATCH_ID AND RETURN DATAFRAME
+    return df.with_column("batch_id", lit(batch_id))
+ 
+# -----------------------------------------------------------------------------
+# 4) RUN SIMULATION & GATHER STATS
+# -----------------------------------------------------------------------------
+
+def run_simulation(
+    session: Session,
+    num_batches: int = num_batches,
+    batch_size: int = batch_size,
+    block_count: int = block_count
+):
+    # COMPUTE TOTAL MARKETING SPEND
+    total_marketing_spend = sum(marketing_spend.values())
+    
+    # BUILD LISTS FOR LEADS, ORDERS, REVENUE AND PROFIT
+    lead_cols  = [f"{ch}_{seg}_lead_alloc"  for ch in channels for seg in segments]
+    orders_cols  = [f"{ch}_{seg}_total_orders"  for ch in channels for seg in segments]
+    revenue_cols = [f"{ch}_{seg}_total_revenue" for ch in channels for seg in segments]
+    profit_cols = [f"{ch}_{seg}_total_profit" for ch in channels for seg in segments]
+    block_size = batch_size // block_count
+
+    convergence_leads, convergence_orders, convergence_revenue, convergence_profit = [], [], [], []
+    summary_stats = []
+
+    for batch in range(1, num_batches + 1):
+        print(f"\n\n--- Starting Batch {batch} ---")
+        
+        # GENERATE BATCH DATA
+        print("Generating batch data...")
+        df = generate_batch(session, batch, batch_size)
+
+        # COMPUTE TOTALS ACROSS ALL CHANNELS AND SEGMENTS
+        print("\nCalculation: total_leads = sum of lead allocations across all channels and segments")
+        print(f"  Input columns: {lead_cols}")
+        total_leads = reduce(lambda a, b: a + b, (col(c) for c in lead_cols))
+        print("  Output: total leads")
+
+        print("\nCalculation: total_orders = sum of orders across all channels and segments")
+        print(f"  Input columns: {orders_cols}")
+        total_orders = reduce(lambda a, b: a + b, (col(o) for o in orders_cols))
+        print("  Output: total orders")
+
+        print("\nCalculation: total_revenue = sum of revenue across all channels and segments")
+        print(f"  Input columns: {revenue_cols}")
+        total_revenue = reduce(lambda a, b: a + b, (col(r) for r in revenue_cols))
+        print("  Output: total revenue")
+        # print(" ")
+
+        print("\nCalculation: total_profit = sum of profit across all channels and segments")
+        print(f"  Input columns: {profit_cols}")
+        total_profit = reduce(lambda a,b: a + b, (col(p) for p in profit_cols))
+        print("  Output: total profit")
+
+        # CREATE DATAFRAME
+        df = df.with_column("total_leads", total_leads) \
+               .with_column("total_orders", total_orders) \
+               .with_column("total_revenue", total_revenue) \
+               .with_column("total_profit", total_profit)
+
+        ##############
+        
+        # CONVERGENCE ON LEADS
+        # print("\nCalculation: leads convergence")
+        blocks_l = (
+            df.with_column("block", sf_floor(col("sim_idx") / lit(block_size)))
+              .group_by("block").agg(sf_avg(col("total_leads")).alias("block_mean_leads"))
+              .order_by("block").collect()
+        )
+        block_values_l = [row["BLOCK_MEAN_LEADS"] for row in blocks_l]
+        # print(f"  Block mean leads: {block_values_l}")
+        cum_l, sum_l = [], 0.0
+        for i, val in enumerate(block_values_l, 1):
+            sum_l += val
+            cum_l.append(sum_l / i)
+        # print(f"  Cumulative mean leads: {cum_l}")
+        convergence_leads.append(cum_l)
+
+        # CONVERGENCE ON ORDERS
+        # print("\nCalculation: orders convergence")
+        blocks_o = (
+            df.with_column("block", sf_floor(col("sim_idx") / lit(block_size)))
+              .group_by("block").agg(sf_avg(col("total_orders")).alias("block_mean_orders"))
+              .order_by("block").collect()
+        )
+        block_values_o = [row["BLOCK_MEAN_ORDERS"] for row in blocks_o]
+        # print(f"  Block mean conversions: {block_values_o}")
+        cum_o, sum_o = [], 0.0
+        for i, val in enumerate(block_values_o, 1):
+            sum_o += val
+            cum_o.append(sum_o / i)
+        # print(f"  Cumulative mean orders: {cum_o}")
+        convergence_orders.append(cum_o)
+
+        # CONVERGENCE ON REVENUE
+        # print("\nCalculation: revenue convergence")
+        blocks_r = (
+            df.with_column("block", sf_floor(col("sim_idx") / lit(block_size)))
+              .group_by("block").agg(sf_avg(col("total_revenue")).alias("block_mean_revenue"))
+              .order_by("block").collect()
+        )
+        block_values_r = [row["BLOCK_MEAN_REVENUE"] for row in blocks_r]
+        # print(f"  Block mean revenue: {block_values_r}")
+        cum_r, sum_r = [], 0.0
+        for i, val in enumerate(block_values_r, 1):
+            sum_r += val
+            cum_r.append(sum_r / i)
+        # print(f"  Cumulative mean revenue: {cum_r}")
+        convergence_revenue.append(cum_r)
+
+        # CONVERGENCE ON PROFIT
+        # print("\nCalculation: profit convergence")
+        blocks_p = (
+            df.with_column("block", sf_floor(col("sim_idx") / lit(block_size)))
+              .group_by("block").agg(sf_avg(col("total_profit")).alias("block_mean_profit"))
+              .order_by("block").collect()
+        )
+        block_values_p = [row["BLOCK_MEAN_PROFIT"] for row in blocks_p]
+        # print(f"  Block mean profit: {block_values_p}")
+        cum_p, sum_p = [], 0.0
+        for i, val in enumerate(block_values_p, 1):
+            sum_p += val
+            cum_p.append(sum_p / i)
+        # print(f"  Cumulative mean profit: {cum_p}")
+        convergence_profit.append(cum_p)
+
+        ##############
+        
+        # SUMMARY STATS FOR LEADS
+        print("\nSimulation Output: total_leads")
+        agg_l = df.agg(
+            sf_avg(col("total_leads")).alias("mean_leads"),
+            sf_stddev(col("total_leads")).alias("std_leads")
+        ).collect()[0]
+        mean_l, std_l = agg_l["MEAN_LEADS"], agg_l["STD_LEADS"]
+        ci_l = 1.96 * std_l / math.sqrt(batch_size)
+        pdf_l = df.select("total_leads").to_pandas()["TOTAL_LEADS"]
+        p5_l, p25_l, p50_l, p75_l, p95_l = pdf_l.quantile([0.05,0.25,0.5,0.75,0.95]).tolist()
+        print(f"  Mean={mean_l:.2f}, STD={std_l:.2f}, 95% CI: [{mean_l-ci_l:.0f}, {mean_l+ci_l:.0f}]")
+        print(f"  Percentiles Output: 5%={p5_l:.0f}, 25%={p25_l:.0f}, 50%={p50_l:.0f}, 75%={p75_l:.0f}, 95%={p95_l:.0f}")
+
+        # SUMMARY STATS FOR ORDERS
+        print("\nSimulation Output: total orders")
+        agg_o = df.agg(
+            sf_avg(col("total_orders")).alias("mean_orders"),
+            sf_stddev(col("total_orders")).alias("std_orders")
+        ).collect()[0]
+        mean_o, std_o = agg_o["MEAN_ORDERS"], agg_o["STD_ORDERS"]
+        ci_o = 1.96 * std_o / math.sqrt(batch_size)
+        pdf_o = df.select("total_orders").to_pandas()["TOTAL_ORDERS"]
+        p5_o, p25_o, p50_o, p75_o, p95_o = pdf_o.quantile([0.05,0.25,0.5,0.75,0.95]).tolist()
+        print(f"  Mean={mean_o:.2f}, STD={std_o:.2f}, 95% CI: [{mean_o-ci_o:.0f}, {mean_o+ci_o:.0f}]")
+        print(f"  Percentiles Output: 5%={p5_o:.0f}, 25%={p25_o:.0f}, 50%={p50_o:.0f}, 75%={p75_o:.0f}, 95%={p95_o:.0f}")
+        
+        # SUMMARY STATS FOR REVENUE
+        print("\nSimulation Output: total revenue")
+        agg_r = df.agg(
+            sf_avg(col("total_revenue")).alias("mean_revenue"),
+            sf_stddev(col("total_revenue")).alias("std_revenue")
+        ).collect()[0]
+        mean_r, std_r = agg_r["MEAN_REVENUE"], agg_r["STD_REVENUE"]
+        ci_r = 1.96 * std_r / math.sqrt(batch_size)
+        pdf_r = df.select("total_revenue").to_pandas()["TOTAL_REVENUE"]
+        p5_r, p25_r, p50_r, p75_r, p95_r = pdf_r.quantile([0.05,0.25,0.5,0.75,0.95]).tolist()
+        print(f"  Mean={mean_r:.2f}, STD={std_r:.2f}, 95% CI: [{mean_r-ci_r:.0f}, {mean_r+ci_r:.0f}]")
+        print(f"  Percentiles Output: 5%={p5_r:.0f}, 25%={p25_r:.0f}, 50%={p50_r:.0f}, 75%={p75_r:.0f}, 95%={p95_r:.0f}")
+
+        # SUMMARY STATS FOR PROFIT
+        print("\nSimulation Output: total profit")
+        agg_p = df.agg(
+            sf_avg(col("total_profit")).alias("mean_total_profit"),
+            sf_stddev(col("total_profit")).alias("std_total_profit")
+        ).collect()[0]
+        mean_p, std_p = agg_p["MEAN_TOTAL_PROFIT"], agg_p["STD_TOTAL_PROFIT"]
+        ci_p = 1.96 * std_p / math.sqrt(batch_size)
+        pdf_p = df.select("total_profit").to_pandas()["TOTAL_PROFIT"]
+        p5_p, p25_p, p50_p, p75_p, p95_p = pdf_p.quantile([0.05,0.25,0.5,0.75,0.95]).tolist()
+        print(f"  Mean={mean_p:.2f}, STD={std_p:.2f}, 95% CI: [{mean_p-ci_p:.0f}, {mean_p+ci_p:.0f}]")
+        print(f"  Percentiles Output: 5%={p5_p:.0f}, 25%={p25_p:.0f}, 50%={p50_p:.0f}, 75%={p75_p:.0f}, 95%={p95_p:.0f}")
+
+        ##############
+        
+        # ROI CALCULATION
+        print("\nCalculation: ROI = (total_profit − total_marketing_spend) / total_marketing_spend")
+        print(f"  Total marketing spend: {total_marketing_spend:.2f}")
+        print(f"  Total profit: {mean_p:.2f}")
+        roi = (mean_p - total_marketing_spend) / total_marketing_spend
+        print(f"  ROI: {roi:.1%}") # (total profit - marketing expense)/marketing expense")
+
+        ##############
+        
+        # PLOT CONVERGENCE FOR LEADS
+        plt.figure(figsize=(8,5))
+        for i, cum in enumerate(convergence_leads, 1):
+            plt.plot(cum, label=f"Batch {i}")
+        plt.xlabel("Block #")
+        plt.ylabel("Cumulative Mean Total Leads")
+        plt.title("Convergence of Lead Estimate")
+        plt.legend(); plt.tight_layout()
+        plt.savefig("/tmp/leads_convergence.png")
+        # print("Leads convergence chart saved to /tmp/leads_convergence.png")
+
+        # PLOT CONVERGENCE FOR ORDERS
+        plt.figure(figsize=(8,5))
+        for i, cum in enumerate(convergence_orders, 1):
+            plt.plot(cum, label=f"Batch {i}")
+        plt.xlabel("Block #")
+        plt.ylabel("Cumulative Mean Total Orders")
+        plt.title("Convergence of Orders Estimate")
+        plt.legend(); plt.tight_layout()
+        plt.savefig("/tmp/orders_convergence.png")
+        # print("Orders convergence chart saved to /tmp/orders_convergence.png")
+    
+        # PLOT CONVERGENCE FOR REVENUE
+        plt.figure(figsize=(8,5))
+        for i, cum in enumerate(convergence_revenue, 1):
+            plt.plot(cum, label=f"Batch {i}")
+        plt.xlabel("Block #")
+        plt.ylabel("Cumulative Mean Total Revenue")
+        plt.title("Convergence of Revenue Estimate")
+        plt.legend(); plt.tight_layout()
+        plt.savefig("/tmp/revenue_convergence.png")
+        # print("Sales convergence chart saved to /tmp/revenue_convergence.png")
+
+        # PLOT CONVERGENCE FOR PROFIT
+        plt.figure(figsize=(8,5))
+        for i, cum in enumerate(convergence_profit, 1):
+            plt.plot(cum, label=f"Batch {i}")
+        plt.xlabel("Block #")
+        plt.ylabel("Cumulative Mean Total Profit")
+        plt.title("Convergence of Profit Estimate")
+        plt.legend(); plt.tight_layout()
+        plt.savefig("/tmp/profit_convergence.png")
+        # print("Sales convergence chart saved to /tmp/profit_convergence.png")
+
+    # COLLECT RESULTS AFTER ITERING ACROSS BATCHES
+    return convergence_leads, convergence_orders, convergence_revenue, convergence_profit, summary_stats
+    
+# -----------------------------------------------------------------------------
+# 8) MAIN FUNCTION
+# -----------------------------------------------------------------------------
+
+def main():
+    conn = {"role": "SYSADMIN", "database": "PRD_MART", "schema": "SHARED"}
+    session = Session.builder.configs(conn).create()
+
+    # UPACK LEADS, ORDERS, REVENUE, PROFIT AND SUMMARY STATS
+    leads_data, orders_data, revenue_data, profit_data, summary_stats = run_simulation(session)
+    session.close()
+
+    try:
+        from IPython.display import Image, HTML, display
+
+        # DISPLAY CONVERGENCE PLOTS
+        display(Image("/tmp/leads_convergence.png"))
+        display(HTML(f'<a href="file:///tmp/leads_convergence.png" target="_blank">Open leads chart</a>'))
+
+        display(Image("/tmp/orders_convergence.png"))
+        display(HTML(f'<a href="file:///tmp/orders_convergence.png" target="_blank">Open orders chart</a>'))
+
+        display(Image("/tmp/revenue_convergence.png"))
+        display(HTML(f'<a href="file:///tmp/revenue_convergence.png" target="_blank">Open revenue chart</a>'))
+
+        display(Image("/tmp/profit_convergence.png"))
+        display(HTML(f'<a href="file:///tmp/profit_convergence.png" target="_blank">Open profit chart</a>'))
+
+    except Exception:
+        print("\nSaved convergence charts to:")
+        print(" - /tmp/leads_convergence.png")
+        print(" - /tmp/orders_convergence.png")
+        print(" - /tmp/revenue_convergence.png")
+        print(" - /tmp/profit_convergence.png")
+    
+    if __name__ == "__main__":
+        main()
